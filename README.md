@@ -169,10 +169,10 @@ and run `hf auth login`, or export an authorized `HF_TOKEN`. The native launcher
 keeps model files in the project cache through `HF_HUB_CACHE` without redirecting
 Hugging Face's normal credential store.
 
-The reduced random-weight SAM 3 architecture smoke test passes on MPS with CPU
-fallback disabled. Full pinned-checkpoint endpoint validation remains a release
-gate until the test account has model access; run it with
-`GRIDSHOT_RUN_MPS_SAM3_TESTS=1` after access is granted.
+The reduced random-weight SAM 3 architecture smoke test and the full pinned SAM 3
+checkpoint `/segment_concept` endpoint both pass on MPS in FP32 with CPU fallback
+disabled. Re-run the checkpoint validation with
+`GRIDSHOT_RUN_MPS_SAM3_TESTS=1` after dependency or model-revision changes.
 
 For a workstation-only deployment without Tailscale:
 
