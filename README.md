@@ -101,11 +101,18 @@ Choose one accelerated runtime:
 This fork validates the native Apple Metal/MPS path. The upstream CUDA path and
 instructions are retained for compatibility but have not been revalidated here.
 
-The 8 GB minimum covers the core SAM 2.1 interactive capture workflow. **12 GB or
-more is recommended** when using SAM 3 concept segmentation or RoMa dense matching,
-because those optional models load on demand and remain resident alongside the
-interactive model. The current container runs inference in BF16; CPU-only and
-pre-Ampere GPUs are not supported configurations.
+For the retained CUDA deployment, the 8 GB minimum covers the core SAM 2.1
+interactive capture workflow. **12 GB or more is recommended** when using SAM 3
+concept segmentation or RoMa dense matching. The current container runs inference
+in BF16; CPU-only and pre-Ampere GPUs are not supported configurations.
+
+The native Mac launcher runs MPS in FP32 with PyTorch CPU fallback disabled. It
+keeps the interactive SAM 2.1 model resident, admits at most one optional model at
+a time, evicts an optional model after five idle minutes on the next inference
+request, and limits cached image embeddings to eight entries and an estimated
+256 MiB. SAM 3 concept segmentation is enabled by default. RoMa is disabled by
+default on Metal and remains an explicit opt-in because that path has not yet been
+validated on MPS.
 
 GridShot uses GPU 0 by default. On a multi-GPU host, choose a different NVIDIA CDI
 device for the current launch:
@@ -155,6 +162,17 @@ scripts/up-macos
 Stop the native services with `scripts/down-macos`. Run native CLI commands with
 `scripts/gridshot-macos`; both use the same `config/`, `projects/`, and loopback
 inference service as the web application.
+
+SAM 3 is a gated Hugging Face model. Before the first concept-segmentation
+request, obtain access from the [SAM 3 model page](https://huggingface.co/facebook/sam3)
+and run `hf auth login`, or export an authorized `HF_TOKEN`. The native launcher
+keeps model files in the project cache through `HF_HUB_CACHE` without redirecting
+Hugging Face's normal credential store.
+
+The reduced random-weight SAM 3 architecture smoke test passes on MPS with CPU
+fallback disabled. Full pinned-checkpoint endpoint validation remains a release
+gate until the test account has model access; run it with
+`GRIDSHOT_RUN_MPS_SAM3_TESTS=1` after access is granted.
 
 For a workstation-only deployment without Tailscale:
 
@@ -267,6 +285,25 @@ Runtime probes are exposed through the web service:
 GPU inference is serialized with two waiting slots by default. Set
 `GRIDSHOT_INFERENCE_QUEUE_SIZE` to change the queue capacity. Saturated requests fail
 quickly with HTTP `429` and `Retry-After` instead of building an unbounded backlog.
+
+Native macOS unified-memory controls are available as exported environment
+variables:
+
+| Setting | Native default | Meaning |
+| --- | --- | --- |
+| `GRIDSHOT_ENABLE_SAM3` | `1` | Enable the on-demand SAM 3 concept lane. |
+| `GRIDSHOT_ENABLE_ROMA` | `0` | Install and enable the unvalidated RoMa Metal lane. |
+| `GRIDSHOT_OPTIONAL_MODEL_RESIDENCY` | `single` | Keep only one optional model resident; `multi` opts out. |
+| `GRIDSHOT_OPTIONAL_MODEL_IDLE_SECONDS` | `300` | Evict an idle optional model on the next inference request; `0` disables idle eviction. |
+| `GRIDSHOT_EMBED_CACHE_MAX_ITEMS` | `8` | Maximum cached interactive image embeddings. |
+| `GRIDSHOT_EMBED_CACHE_MAX_MIB` | `256` | Estimated combined tensor and decoded-image cache budget. |
+
+`/api/health/capabilities` reports each optional lane as `disabled`,
+`unavailable`, `not_loaded`, `ready`, `evicted`, or `error`, along with residency,
+embedding-cache, and MPS allocator telemetry. To experiment with RoMa on Metal,
+run `GRIDSHOT_ENABLE_ROMA=1 scripts/up-macos`; the launcher then installs the
+separate `matcher` dependency extra. This does not imply that RoMa has passed the
+Metal validation gate.
 
 ## Product status
 

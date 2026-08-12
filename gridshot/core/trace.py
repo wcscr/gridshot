@@ -243,7 +243,12 @@ def _auto_mask(pixels, profile, calibration) -> tuple[np.ndarray, list[str]]:
                 f"no empty-mat reference for '{profile.mat_id}' — using concept "
                 "detection (a reference improves robustness: `gridshot mat reference`)"
             )
-        result = _concept_locate_refine(pixels, calibration, seg_client)
+        concept_unavailable = None
+        try:
+            result = _concept_locate_refine(pixels, calibration, seg_client)
+        except seg_client.OptionalCapabilityUnavailable as exc:
+            result = None
+            concept_unavailable = str(exc)
         if result is not None:
             mask, score = result
             message = f"concept-path mask confidence {score:.2f}"
@@ -251,7 +256,12 @@ def _auto_mask(pixels, profile, calibration) -> tuple[np.ndarray, list[str]]:
                 message += " — inspect the outline SVG"
             warnings.append(message)
             return mask, warnings
-        warnings.append("concept detection found no tool-sized object")
+        if concept_unavailable is not None:
+            warnings.append(
+                f"concept segmentation unavailable ({concept_unavailable})"
+            )
+        else:
+            warnings.append("concept detection found no tool-sized object")
     else:
         warnings.append("segserver unreachable — `docker compose up -d segserver`")
 

@@ -56,15 +56,34 @@ fi
 
 mkdir -p config/cache/hf config/cache/torch config/logs config/run projects
 
+export GRIDSHOT_ENABLE_SAM3="${GRIDSHOT_ENABLE_SAM3:-1}"
+export GRIDSHOT_ENABLE_ROMA="${GRIDSHOT_ENABLE_ROMA:-0}"
+export GRIDSHOT_OPTIONAL_MODEL_RESIDENCY="${GRIDSHOT_OPTIONAL_MODEL_RESIDENCY:-single}"
+export GRIDSHOT_OPTIONAL_MODEL_IDLE_SECONDS="${GRIDSHOT_OPTIONAL_MODEL_IDLE_SECONDS:-300}"
+export GRIDSHOT_EMBED_CACHE_MAX_ITEMS="${GRIDSHOT_EMBED_CACHE_MAX_ITEMS:-8}"
+export GRIDSHOT_EMBED_CACHE_MAX_MIB="${GRIDSHOT_EMBED_CACHE_MAX_MIB:-256}"
+
 npm --prefix web ci
 npm --prefix web run build
-uv sync --frozen --extra server --extra inference
+uv_args=(sync --frozen --extra server --extra inference)
+case "$GRIDSHOT_ENABLE_ROMA" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn])
+        uv_args+=(--extra matcher)
+        ;;
+    0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff])
+        ;;
+    *)
+        echo "Invalid GRIDSHOT_ENABLE_ROMA=$GRIDSHOT_ENABLE_ROMA" >&2
+        exit 2
+        ;;
+esac
+uv "${uv_args[@]}"
 
 export GRIDSHOT_ACCELERATOR="${GRIDSHOT_ACCELERATOR:-mps}"
 export GRIDSHOT_DTYPE="${GRIDSHOT_DTYPE:-auto}"
 export GRIDSHOT_CONFIG_DIR="${GRIDSHOT_CONFIG_DIR:-$repo_dir/config}"
 export GRIDSHOT_SEGSERVER_URL="${GRIDSHOT_SEGSERVER_URL:-http://127.0.0.1:8801}"
-export HF_HOME="${HF_HOME:-$repo_dir/config/cache/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$repo_dir/config/cache/hf/hub}"
 export TORCH_HOME="${TORCH_HOME:-$repo_dir/config/cache/torch}"
 export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-0}"
 
@@ -73,6 +92,7 @@ import os
 
 import torch
 from gridshot.segserver.backend import resolve_policy
+from gridshot.segserver.residency import env_flag, env_int, optional_residency_mode
 
 policy = resolve_policy(torch)
 if policy.device != "mps":
@@ -83,7 +103,27 @@ if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
     raise SystemExit(
         "PYTORCH_ENABLE_MPS_FALLBACK=1 is diagnostic-only; disable it for the native launcher"
     )
-print(f"Metal preflight: PyTorch {torch.__version__}, device={policy.device}, dtype={policy.dtype_name}")
+sam3_enabled = env_flag("GRIDSHOT_ENABLE_SAM3", default=True)
+roma_enabled = env_flag("GRIDSHOT_ENABLE_ROMA", default=False)
+residency = optional_residency_mode(policy.device)
+idle_seconds = env_int(
+    "GRIDSHOT_OPTIONAL_MODEL_IDLE_SECONDS", default=300, minimum=0, maximum=86_400
+)
+cache_items = env_int(
+    "GRIDSHOT_EMBED_CACHE_MAX_ITEMS", default=8, minimum=1, maximum=64
+)
+cache_mib = env_int(
+    "GRIDSHOT_EMBED_CACHE_MAX_MIB", default=256, minimum=16, maximum=32_768
+)
+print(
+    f"Metal preflight: PyTorch {torch.__version__}, "
+    f"device={policy.device}, dtype={policy.dtype_name}"
+)
+print(
+    "Metal residency: "
+    f"sam3={sam3_enabled}, roma={roma_enabled}, optional={residency}, "
+    f"idle={idle_seconds}s, embeddings={cache_items}/{cache_mib}MiB"
+)
 PY
 
 service_running() {
