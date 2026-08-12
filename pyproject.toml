@@ -25,6 +25,15 @@ server = [
     "httpx>=0.27",
     "python-multipart>=0.0.9",
 ]
+inference = [
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "transformers==5.13.1",
+    "accelerate==1.14.0",
+]
+matcher = [
+    "romatch==0.1.2",
+]
 
 [project.scripts]
 gridshot = "gridshot.cli.main:app"
@@ -35,4 +44,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gridshot"]
-

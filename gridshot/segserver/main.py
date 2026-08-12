@@ -1,9 +1,9 @@
-"""GPU segmentation service: SAM 2.1 point-prompted masks over HTTP.
+"""Accelerated segmentation service: SAM 2.1 point-prompted masks over HTTP.
 
-Runs on the RTX 5090 (compose-reserved).  The M1.5 headless trace flow sends
-prompt points derived from empty-mat differencing; the M3 web editor will
-send interactive clicks against the same endpoint.  Model weights download
-once into the bind-mounted HF cache.
+Runs on CUDA in the Compose deployment and Metal/MPS in the native macOS
+deployment. The M1.5 headless trace flow sends prompt points derived from
+empty-mat differencing; the M3 web editor sends interactive clicks against
+the same endpoint. Model weights download once into the configured HF cache.
 
 API (multipart form):
   POST /segment
@@ -33,10 +33,24 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from PIL import Image
 
-# "sam2" → SAM 2.1 hiera-large; "sam3" → SAM 3's interactive tracker head
+from .backend import AcceleratorPolicy, accelerator_report, resolve_policy
+
+# "sam2" → SAM 2.1 hiera-large; "sam3" → SAM 3's interactive tracker head.
+# Pin Hub commits so every backend uses identical model artifacts.
 MODEL_FAMILY = os.environ.get("GRIDSHOT_SAM", "sam2")
 MODEL_IDS = {"sam2": "facebook/sam2.1-hiera-large", "sam3": "facebook/sam3"}
+MODEL_REVISIONS = {
+    "sam2": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
+    "sam3": "3c879f39826c281e95690f02c7821c4de09afae7",
+}
 MODEL_ID = MODEL_IDS[MODEL_FAMILY]
+MODEL_REVISION = (
+    os.environ.get("GRIDSHOT_SAM_REVISION") or MODEL_REVISIONS[MODEL_FAMILY]
+)
+CONCEPT_MODEL_ID = "facebook/sam3"
+CONCEPT_MODEL_REVISION = (
+    os.environ.get("GRIDSHOT_SAM3_REVISION") or MODEL_REVISIONS["sam3"]
+)
 
 app = FastAPI(title="gridshot-segserver")
 
@@ -105,8 +119,20 @@ class InferenceAdmission:
 _inference_admission = InferenceAdmission(_queue_capacity())
 
 
+def _runtime_policy() -> AcceleratorPolicy:
+    """Resolve one shared accelerator policy for every model lane."""
+
+    policy = _state.get("runtime_policy")
+    if policy is None:
+        import torch
+
+        policy = resolve_policy(torch)
+        _state["runtime_policy"] = policy
+    return policy
+
+
 def bounded_inference(capability: str):
-    """Run one GPU operation while bounding requests waiting behind it."""
+    """Run one accelerator operation while bounding requests waiting behind it."""
 
     def decorate(function):
         @wraps(function)
@@ -126,8 +152,6 @@ def _load():
     with _model_lock:
         if "model" in _state:
             return
-        import torch
-
         if MODEL_FAMILY == "sam3":
             from transformers import Sam3TrackerModel, Sam3TrackerProcessor
 
@@ -137,13 +161,17 @@ def _load():
 
             processor_cls, model_cls = Sam2Processor, Sam2Model
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _state["processor"] = processor_cls.from_pretrained(MODEL_ID)
+        policy = _runtime_policy()
+        device = policy.device
+        _state["processor"] = processor_cls.from_pretrained(
+            MODEL_ID, revision=MODEL_REVISION
+        )
         _state["model"] = model_cls.from_pretrained(
-            MODEL_ID, torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32
+            MODEL_ID, revision=MODEL_REVISION, dtype=policy.dtype
         ).to(device)
         _state["model"].eval()
         _state["device"] = device
+        _state["dtype"] = policy.dtype_name
 
 
 def _load_concept():
@@ -154,17 +182,21 @@ def _load_concept():
     with _concept_lock:
         if "concept_model" in _state:
             return
-        import torch
         from transformers import Sam3Model, Sam3Processor
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _state["concept_processor"] = Sam3Processor.from_pretrained("facebook/sam3")
+        policy = _runtime_policy()
+        device = policy.device
+        _state["concept_processor"] = Sam3Processor.from_pretrained(
+            CONCEPT_MODEL_ID, revision=CONCEPT_MODEL_REVISION
+        )
         _state["concept_model"] = Sam3Model.from_pretrained(
-            "facebook/sam3",
-            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+            CONCEPT_MODEL_ID,
+            revision=CONCEPT_MODEL_REVISION,
+            dtype=policy.dtype,
         ).to(device)
         _state["concept_model"].eval()
         _state["concept_device"] = device
+        _state["concept_dtype"] = policy.dtype_name
 
 
 def _load_matcher():
@@ -174,13 +206,18 @@ def _load_matcher():
     with _matcher_lock:
         if "matcher" in _state:
             return
-        import torch
         from romatch import roma_outdoor
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        policy = _runtime_policy()
+        device = policy.device
         _state["matcher"] = roma_outdoor(device=device, use_custom_corr=False)
         _state["matcher"].eval()
         _state["matcher_device"] = device
+        # RoMa 0.1.2 only enables autocast for CUDA.  Report its actual
+        # non-CUDA behavior instead of claiming the global requested dtype.
+        _state["matcher_dtype"] = (
+            policy.dtype_name if device == "cuda" else "float32"
+        )
 
 
 def _ensure_component(name: str, loader) -> None:
@@ -193,40 +230,56 @@ def _ensure_component(name: str, loader) -> None:
 
 
 def _component_capability(
-    *, key: str, error_key: str, model: str, device_key: str
+    *,
+    key: str,
+    error_key: str,
+    model: str,
+    revision: str | None,
+    device_key: str,
+    dtype_key: str,
 ) -> dict:
     error = _state.get(error_key)
     loaded = key in _state
     return {
         "status": "ready" if loaded else ("error" if error else "not_loaded"),
         "model": model,
+        "revision": revision,
         "loaded": loaded,
         "device": _state.get(device_key),
+        "dtype": _state.get(dtype_key),
         "error": error,
     }
 
 
 def _capabilities_payload() -> dict:
+    runtime = accelerator_report()
     return {
-        "status": "ok",
+        "status": "ok" if runtime["status"] == "ok" else "degraded",
+        "runtime": runtime,
         "capabilities": {
             "interactive_segmentation": _component_capability(
                 key="model",
                 error_key="interactive_error",
                 model=MODEL_ID,
+                revision=MODEL_REVISION,
                 device_key="device",
+                dtype_key="dtype",
             ),
             "concept_segmentation": _component_capability(
                 key="concept_model",
                 error_key="concept_error",
-                model="facebook/sam3",
+                model=CONCEPT_MODEL_ID,
+                revision=CONCEPT_MODEL_REVISION,
                 device_key="concept_device",
+                dtype_key="concept_dtype",
             ),
             "dense_matching": _component_capability(
                 key="matcher",
                 error_key="matcher_error",
                 model="roma-outdoor-0.1.2",
+                revision=None,
                 device_key="matcher_device",
+                dtype_key="matcher_dtype",
             ),
         },
         "inference": _inference_admission.stats(),
@@ -256,6 +309,7 @@ def _readiness_payload() -> tuple[dict, int]:
                 {
                     "status": "not_ready",
                     "model": MODEL_ID,
+                    "revision": MODEL_REVISION,
                     "error": str(exc)[:240],
                 },
                 503,
@@ -264,7 +318,9 @@ def _readiness_payload() -> tuple[dict, int]:
         {
             "status": "ready",
             "model": MODEL_ID,
+            "revision": MODEL_REVISION,
             "device": _state.get("device"),
+            "dtype": _state.get("dtype"),
         },
         200,
     )
@@ -411,7 +467,7 @@ def _rasterize_poly(poly: list, image, output_size=None) -> np.ndarray | None:
     return np.asarray(m) > 127
 
 
-def _mask_prior(poly: list, image, device) -> "object | None":
+def _mask_prior(poly: list, image, device, dtype) -> "object | None":
     """Build a deliberately soft dense prior so new clicks can still change it."""
     import torch
 
@@ -419,7 +475,6 @@ def _mask_prior(poly: list, image, device) -> "object | None":
     if arr is None:
         return None
     logits = (arr.astype(np.float32) * 2.0 - 1.0) * 2.0
-    dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
     return torch.from_numpy(logits)[None, None].to(device=device, dtype=dtype)
 
 
@@ -499,7 +554,9 @@ def decode(
 
     proc, model, device = _state["processor"], _state["model"], _state["device"]
     prior_poly = json.loads(mask_poly) if mask_poly else None
-    input_masks = _mask_prior(prior_poly, ent["image"], device)
+    input_masks = _mask_prior(
+        prior_poly, ent["image"], device, _runtime_policy().dtype
+    )
     prior = _rasterize_poly(prior_poly, ent["image"])
     proc_kwargs = {"images": ent["image"], "return_tensors": "pt"}
     if pts:

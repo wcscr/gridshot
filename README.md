@@ -83,10 +83,23 @@ The same accepted outline can produce three bin styles:
 
 ### Requirements
 
-- Docker with Compose
-- NVIDIA Container Toolkit
+- Tailscale CLI (optional) for the phone-friendly HTTPS endpoint used by the launch scripts
+
+Choose one accelerated runtime:
+
+**Apple Metal (initial support):**
+
+- Apple-silicon Mac running macOS 14 or later
+- Arm64 Python 3.12, [`uv`](https://docs.astral.sh/uv/), Node.js, and npm
+- Xcode command-line tools (`xcode-select --install`)
+
+**NVIDIA CUDA:**
+
+- Docker with Compose and NVIDIA Container Toolkit
 - NVIDIA Ampere-generation or newer GPU with at least **8 GB VRAM**
-- Tailscale CLI (optional) for the phone-friendly HTTPS endpoint used by `scripts/up`
+
+This fork validates the native Apple Metal/MPS path. The upstream CUDA path and
+instructions are retained for compatibility but have not been revalidated here.
 
 The 8 GB minimum covers the core SAM 2.1 interactive capture workflow. **12 GB or
 more is recommended** when using SAM 3 concept segmentation or RoMa dense matching,
@@ -126,18 +139,33 @@ with calipers and record both values. An unverified mat cannot be used for captu
 
 ### 2. Start GridShot
 
+On an NVIDIA workstation:
+
 ```bash
 scripts/up
 ```
+
+On an Apple-silicon Mac, run the web and inference processes natively so
+PyTorch can reach Metal:
+
+```bash
+scripts/up-macos
+```
+
+Stop the native services with `scripts/down-macos`. Run native CLI commands with
+`scripts/gridshot-macos`; both use the same `config/`, `projects/`, and loopback
+inference service as the web application.
 
 For a workstation-only deployment without Tailscale:
 
 ```bash
 scripts/up --no-tailscale
+# or on macOS
+scripts/up-macos --no-tailscale
 ```
 
-`scripts/up` builds and starts the web and segmentation services, then exposes the
-web app through Tailscale:
+The launch scripts build and start the web and segmentation services, then expose
+the web app through Tailscale:
 
 - `http://localhost:8800` on the workstation
 - `https://<host>.<tailnet>.ts.net/` from a tailnet-connected phone
@@ -215,16 +243,18 @@ for diagnosis but cannot become active; severe disagreement is rejected.
 
 GridShot stores capture sessions and generated artifacts in `projects/`. Calibration,
 printer profiles, the tool library, and downloaded model caches live in `config/`.
-Both directories are created automatically by `scripts/up`; back them up before
+Both directories are created automatically by the launch scripts; back them up before
 moving or upgrading a deployment.
 
-Copy `.env.example` to `.env` for persistent GPU, model, queue, or Hugging Face token
-settings. Use `scripts/prune --dry-run` to preview cleanup of old capture projects.
+Copy `.env.example` to `.env` for persistent Docker/CUDA settings. The native
+macOS launcher accepts the same settings as exported environment variables, for
+example `HF_TOKEN=... scripts/up-macos`. Use `scripts/prune --dry-run` to preview
+cleanup of old capture projects.
 
-| Service | Port | GPU | Role |
+| Service | Port | Accelerator | Role |
 | --- | ---: | --- | --- |
-| `web` | `8800` | No | FastAPI, the React SPA, and the public API boundary |
-| `segserver` | `8801` internal | Yes | SAM 2.1 interactive segmentation, SAM 3 concept segmentation, and dense matching |
+| `web` | `8800` | None | FastAPI, the React SPA, and the public API boundary |
+| `segserver` | `8801` internal/loopback | CUDA or Metal/MPS | SAM 2.1 interactive segmentation, SAM 3 concept segmentation, and dense matching |
 
 Runtime probes are exposed through the web service:
 

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Build and start GridShot natively on Apple Silicon with PyTorch Metal/MPS.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/up-macos [--no-tailscale]
+
+Build the web UI, verify native MPS support, and start the web and inference
+services on macOS. Both services bind to loopback; Tailscale Serve optionally
+publishes only the web service.
+
+Options:
+  --no-tailscale  Skip Tailscale Serve configuration; use localhost only.
+  -h, --help      Show this help message.
+EOF
+}
+
+use_tailscale=true
+while (($#)); do
+    case "$1" in
+        --no-tailscale)
+            use_tailscale=false
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_dir"
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    echo "scripts/up-macos requires an Apple Silicon Mac." >&2
+    exit 1
+fi
+
+for command_name in uv npm curl lsof; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Missing required command: $command_name" >&2
+        exit 1
+    fi
+done
+if "$use_tailscale" && ! command -v tailscale >/dev/null 2>&1; then
+    echo "Tailscale is not installed; use --no-tailscale or install its CLI." >&2
+    exit 1
+fi
+
+mkdir -p config/cache/hf config/cache/torch config/logs config/run projects
+
+npm --prefix web ci
+npm --prefix web run build
+uv sync --frozen --extra server --extra inference
+
+export GRIDSHOT_ACCELERATOR="${GRIDSHOT_ACCELERATOR:-mps}"
+export GRIDSHOT_DTYPE="${GRIDSHOT_DTYPE:-auto}"
+export GRIDSHOT_CONFIG_DIR="${GRIDSHOT_CONFIG_DIR:-$repo_dir/config}"
+export GRIDSHOT_SEGSERVER_URL="${GRIDSHOT_SEGSERVER_URL:-http://127.0.0.1:8801}"
+export HF_HOME="${HF_HOME:-$repo_dir/config/cache/hf}"
+export TORCH_HOME="${TORCH_HOME:-$repo_dir/config/cache/torch}"
+export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-0}"
+
+.venv/bin/python - <<'PY'
+import os
+
+import torch
+from gridshot.segserver.backend import resolve_policy
+
+policy = resolve_policy(torch)
+if policy.device != "mps":
+    raise SystemExit(
+        f"native macOS launch requires Metal/MPS, resolved {policy.device!r} instead"
+    )
+if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
+    raise SystemExit(
+        "PYTORCH_ENABLE_MPS_FALLBACK=1 is diagnostic-only; disable it for the native launcher"
+    )
+print(f"Metal preflight: PyTorch {torch.__version__}, device={policy.device}, dtype={policy.dtype_name}")
+PY
+
+service_running() {
+    local pid_file="$1"
+    local expected="$2"
+    [[ -f "$pid_file" ]] || return 1
+    local pid
+    pid="$(tr -dc '0-9' < "$pid_file")"
+    [[ -n "$pid" ]] || return 1
+    ps -p "$pid" -o command= 2>/dev/null | grep -Fq "$expected"
+}
+
+start_service() {
+    local name="$1"
+    local app_module="$2"
+    local port="$3"
+    local pid_file="config/run/$name.pid"
+    local log_file="config/logs/$name.log"
+
+    if service_running "$pid_file" "$app_module"; then
+        echo "$name is already running (PID $(<"$pid_file"))."
+        return
+    fi
+    rm -f "$pid_file"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+        echo "Port $port is already in use; refusing to replace its process." >&2
+        exit 1
+    fi
+    nohup .venv/bin/uvicorn "$app_module" \
+        --host 127.0.0.1 --port "$port" >"$log_file" 2>&1 &
+    echo "$!" > "$pid_file"
+}
+
+start_service segserver gridshot.segserver.main:app 8801
+start_service web gridshot.server.app:app 8800
+
+for ((attempt = 1; attempt <= 240; attempt++)); do
+    if curl --fail --silent http://127.0.0.1:8801/live >/dev/null \
+        && curl --fail --silent http://127.0.0.1:8800/api/health/live >/dev/null; then
+        break
+    fi
+    if ! service_running config/run/segserver.pid gridshot.segserver.main:app \
+        || ! service_running config/run/web.pid gridshot.server.app:app; then
+        break
+    fi
+    sleep 0.25
+done
+if ! curl --fail --silent http://127.0.0.1:8801/live >/dev/null \
+    || ! curl --fail --silent http://127.0.0.1:8800/api/health/live >/dev/null; then
+    echo "GridShot failed to become live; inspect config/logs/*.log." >&2
+    "$repo_dir/scripts/down-macos" || true
+    exit 1
+fi
+if ! service_running config/run/segserver.pid gridshot.segserver.main:app \
+    || ! service_running config/run/web.pid gridshot.server.app:app; then
+    echo "A GridShot service exited during startup; inspect config/logs/*.log." >&2
+    "$repo_dir/scripts/down-macos" || true
+    exit 1
+fi
+
+echo
+echo "GridShot is up with Metal acceleration:"
+if "$use_tailscale"; then
+    tailscale serve --bg 8800
+    tailscale serve status 2>/dev/null | sed -n '1p' || true
+else
+    echo "  Tailscale configuration skipped (--no-tailscale)"
+fi
+echo "  local:  http://localhost:8800"
+echo "  logs:   $repo_dir/config/logs"

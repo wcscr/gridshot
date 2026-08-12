@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run the GridShot CLI natively against the local Metal inference service.
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_dir"
+
+export GRIDSHOT_CONFIG_DIR="${GRIDSHOT_CONFIG_DIR:-$repo_dir/config}"
+export GRIDSHOT_SEGSERVER_URL="${GRIDSHOT_SEGSERVER_URL:-http://127.0.0.1:8801}"
+exec uv run --frozen --extra server gridshot "$@"
