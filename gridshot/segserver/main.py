@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import base64
 import gc
-import importlib.util
 import io
 import json
 import os
@@ -39,15 +38,12 @@ from PIL import Image
 
 from .backend import AcceleratorPolicy, accelerator_report, resolve_policy
 from .residency import (
-    ResidencyConfigurationError,
-    env_flag,
-    env_int,
+    optional_model_idle_seconds,
     optional_residency_mode,
-    retained_bytes,
 )
 
 # "sam2" → SAM 2.1 hiera-large; "sam3" → SAM 3's interactive tracker head.
-# Pin Hub commits so every backend uses identical model artifacts.
+# Pin the Metal validation artifacts without changing CUDA's upstream model loads.
 MODEL_FAMILY = os.environ.get("GRIDSHOT_SAM", "sam2")
 MODEL_IDS = {"sam2": "facebook/sam2.1-hiera-large", "sam3": "facebook/sam3"}
 MODEL_REVISIONS = {
@@ -81,6 +77,7 @@ _OPTIONAL_LANES = {
             "concept_model",
             "concept_device",
             "concept_dtype",
+            "concept_revision",
         ),
     },
     "matcher": {
@@ -165,86 +162,14 @@ def _runtime_policy() -> AcceleratorPolicy:
     return policy
 
 
+def _metal_revision(device: str | None, revision: str) -> str | None:
+    """Use validated Hub artifacts on Metal and preserve upstream elsewhere."""
+
+    return revision if device == "mps" else None
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _optional_lane_configuration(name: str, device: str | None = None) -> dict:
-    """Return an optional lane's configured and dependency availability."""
-
-    if name not in _OPTIONAL_LANES:
-        raise KeyError(f"unknown optional model lane: {name}")
-
-    env_name = "GRIDSHOT_ENABLE_SAM3" if name == "concept" else "GRIDSHOT_ENABLE_ROMA"
-    default = True if name == "concept" else device != "mps"
-    try:
-        enabled = env_flag(env_name, default=default)
-    except ResidencyConfigurationError as exc:
-        return {
-            "enabled": False,
-            "available": False,
-            "environment": env_name,
-            "reason": str(exc),
-            "configuration_error": str(exc),
-        }
-
-    if not enabled:
-        if name == "matcher" and device == "mps" and env_name not in os.environ:
-            reason = (
-                "RoMa is disabled by default on Metal; install the matcher extra "
-                "and set GRIDSHOT_ENABLE_ROMA=1 to opt in"
-            )
-        else:
-            reason = f"disabled by {env_name}"
-        return {
-            "enabled": False,
-            "available": False,
-            "environment": env_name,
-            "reason": reason,
-            "configuration_error": None,
-        }
-
-    if name == "matcher" and importlib.util.find_spec("romatch") is None:
-        return {
-            "enabled": True,
-            "available": False,
-            "environment": env_name,
-            "reason": "RoMa is not installed; run uv sync --extra matcher",
-            "configuration_error": None,
-        }
-
-    return {
-        "enabled": True,
-        "available": True,
-        "environment": env_name,
-        "reason": None,
-        "configuration_error": None,
-    }
-
-
-def _optional_residency_configuration(device: str) -> dict:
-    default_idle_seconds = 300 if device == "mps" else 0
-    errors = []
-    try:
-        mode = optional_residency_mode(device)
-    except ResidencyConfigurationError as exc:
-        mode = None
-        errors.append(str(exc))
-    try:
-        idle_seconds = env_int(
-            "GRIDSHOT_OPTIONAL_MODEL_IDLE_SECONDS",
-            default=default_idle_seconds,
-            minimum=0,
-            maximum=86_400,
-        )
-    except ResidencyConfigurationError as exc:
-        idle_seconds = default_idle_seconds
-        errors.append(str(exc))
-    return {
-        "mode": mode,
-        "idle_seconds": idle_seconds,
-        "configuration_error": "; ".join(errors) or None,
-    }
 
 
 def _synchronize_model_device(device: str | None) -> None:
@@ -307,8 +232,7 @@ def _evict_idle_optional_models(exclude: str | None = None) -> None:
         device = _runtime_policy().device
     except Exception:
         return
-    config = _optional_residency_configuration(device)
-    idle_seconds = config["idle_seconds"]
+    idle_seconds = optional_model_idle_seconds(device)
     if idle_seconds <= 0:
         return
 
@@ -329,14 +253,7 @@ def _prepare_optional_lane(name: str) -> None:
     """Validate, admit, and touch an optional model lane before loading it."""
 
     device = _runtime_policy().device
-    lane = _optional_lane_configuration(name, device)
-    if not lane["enabled"] or not lane["available"]:
-        raise HTTPException(status_code=503, detail=lane["reason"])
-
-    residency = _optional_residency_configuration(device)
-    if residency["configuration_error"]:
-        raise HTTPException(status_code=503, detail=residency["configuration_error"])
-    if residency["mode"] == "single":
+    if optional_residency_mode(device) == "single":
         for other in _OPTIONAL_LANES:
             if other != name:
                 _evict_optional_lane(
@@ -381,9 +298,11 @@ def _load():
 
         policy = _runtime_policy()
         device = policy.device
-        processor = processor_cls.from_pretrained(MODEL_ID, revision=MODEL_REVISION)
+        revision = _metal_revision(device, MODEL_REVISION)
+        revision_kwargs = {"revision": revision} if revision is not None else {}
+        processor = processor_cls.from_pretrained(MODEL_ID, **revision_kwargs)
         model = model_cls.from_pretrained(
-            MODEL_ID, revision=MODEL_REVISION, dtype=policy.dtype
+            MODEL_ID, dtype=policy.dtype, **revision_kwargs
         ).to(device)
         model.eval()
         _state.update(
@@ -392,6 +311,7 @@ def _load():
                 "model": model,
                 "device": device,
                 "dtype": policy.dtype_name,
+                "revision": revision,
             }
         )
 
@@ -409,13 +329,15 @@ def _load_concept():
 
         policy = _runtime_policy()
         device = policy.device
+        revision = _metal_revision(device, CONCEPT_MODEL_REVISION)
+        revision_kwargs = {"revision": revision} if revision is not None else {}
         processor = Sam3Processor.from_pretrained(
-            CONCEPT_MODEL_ID, revision=CONCEPT_MODEL_REVISION
+            CONCEPT_MODEL_ID, **revision_kwargs
         )
         model = Sam3Model.from_pretrained(
             CONCEPT_MODEL_ID,
-            revision=CONCEPT_MODEL_REVISION,
             dtype=policy.dtype,
+            **revision_kwargs,
         ).to(device)
         model.eval()
         _state.update(
@@ -424,6 +346,7 @@ def _load_concept():
                 "concept_model": model,
                 "concept_device": device,
                 "concept_dtype": policy.dtype_name,
+                "concept_revision": revision,
             }
         )
         _state.setdefault("optional_evicted", {}).pop("concept", None)
@@ -458,33 +381,12 @@ def _load_matcher():
         _touch_optional_lane("matcher")
 
 
-def _model_load_error(exc: Exception) -> str:
-    raw = " ".join(str(exc).split())
-    lowered = raw.lower()
-    if "gated repo" in lowered or "authorized list" in lowered:
-        return (
-            "gated Hugging Face model access denied; request model access and "
-            "authenticate with `hf auth login` or an authorized HF_TOKEN"
-        )
-    return raw[:240]
-
-
-def _ensure_component(name: str, loader, *, optional: bool = False) -> None:
+def _ensure_component(name: str, loader) -> None:
     try:
         loader()
         _state.pop(f"{name}_error", None)
-    except HTTPException:
-        # Disabled/unavailable optional capabilities are deliberate service
-        # state, not model-load failures.
-        raise
     except Exception as exc:
-        error = _model_load_error(exc)
-        _state[f"{name}_error"] = error
-        if optional:
-            raise HTTPException(
-                status_code=503,
-                detail=f"{name} model unavailable: {error}",
-            ) from exc
+        _state[f"{name}_error"] = str(exc)[:240]
         raise
 
 
@@ -497,35 +399,15 @@ def _component_capability(
     device_key: str,
     dtype_key: str,
     optional_lane: str | None = None,
-    runtime_device: str | None = None,
 ) -> dict:
     error = _state.get(error_key)
     loaded = key in _state
-    configuration = (
-        _optional_lane_configuration(optional_lane, runtime_device)
-        if optional_lane is not None
-        else {
-            "enabled": True,
-            "available": True,
-            "environment": None,
-            "reason": None,
-            "configuration_error": None,
-        }
-    )
     evicted = (
         _state.get("optional_evicted", {}).get(optional_lane)
         if optional_lane is not None
         else None
     )
-    if not configuration["enabled"]:
-        status = (
-            "misconfigured"
-            if configuration["configuration_error"]
-            else "disabled"
-        )
-    elif not configuration["available"]:
-        status = "unavailable"
-    elif loaded:
+    if loaded:
         status = "ready"
     elif error:
         status = "error"
@@ -542,59 +424,13 @@ def _component_capability(
         "device": _state.get(device_key),
         "dtype": _state.get(dtype_key),
         "error": error,
-        "enabled": configuration["enabled"],
-        "available": configuration["available"],
-        "reason": configuration["reason"],
     }
     if optional_lane is not None:
-        payload["configuration_environment"] = configuration["environment"]
         payload["last_used_at"] = _state.get("optional_last_used_at", {}).get(
             optional_lane
         )
         payload["last_eviction"] = evicted
     return payload
-
-
-def _embed_cache_limits() -> dict:
-    errors = []
-    try:
-        max_items = env_int(
-            "GRIDSHOT_EMBED_CACHE_MAX_ITEMS",
-            default=8,
-            minimum=1,
-            maximum=64,
-        )
-    except ResidencyConfigurationError as exc:
-        max_items = 8
-        errors.append(str(exc))
-    try:
-        max_mib = env_int(
-            "GRIDSHOT_EMBED_CACHE_MAX_MIB",
-            default=256,
-            minimum=16,
-            maximum=32_768,
-        )
-    except ResidencyConfigurationError as exc:
-        max_mib = 256
-        errors.append(str(exc))
-    return {
-        "max_items": max_items,
-        "max_bytes": max_mib * 1024 * 1024,
-        "configuration_error": "; ".join(errors) or None,
-    }
-
-
-def _embed_cache_report() -> dict:
-    limits = _embed_cache_limits()
-    return {
-        "entries": len(_EMBED_CACHE),
-        "retained_bytes": _EMBED_CACHE_BYTES,
-        "max_items": limits["max_items"],
-        "max_bytes": limits["max_bytes"],
-        "over_budget": _EMBED_CACHE_BYTES > limits["max_bytes"],
-        "evictions_total": _EMBED_CACHE_EVICTIONS,
-        "configuration_error": limits["configuration_error"],
-    }
 
 
 def _optional_residency_report(runtime_device: str | None) -> dict:
@@ -604,19 +440,16 @@ def _optional_residency_report(runtime_device: str | None) -> dict:
             "idle_seconds": None,
             "loaded": [],
             "evictions_total": int(_state.get("optional_evictions_total", 0)),
-            "configuration_error": "accelerator policy is unresolved",
         }
-    config = _optional_residency_configuration(runtime_device)
     return {
-        "mode": config["mode"],
-        "idle_seconds": config["idle_seconds"],
+        "mode": optional_residency_mode(runtime_device),
+        "idle_seconds": optional_model_idle_seconds(runtime_device),
         "loaded": [
             spec["capability"]
             for spec in _OPTIONAL_LANES.values()
             if spec["model_key"] in _state
         ],
         "evictions_total": int(_state.get("optional_evictions_total", 0)),
-        "configuration_error": config["configuration_error"],
     }
 
 
@@ -631,20 +464,18 @@ def _capabilities_payload() -> dict:
                 key="model",
                 error_key="interactive_error",
                 model=MODEL_ID,
-                revision=MODEL_REVISION,
+                revision=_metal_revision(runtime_device, MODEL_REVISION),
                 device_key="device",
                 dtype_key="dtype",
-                runtime_device=runtime_device,
             ),
             "concept_segmentation": _component_capability(
                 key="concept_model",
                 error_key="concept_error",
                 model=CONCEPT_MODEL_ID,
-                revision=CONCEPT_MODEL_REVISION,
+                revision=_metal_revision(runtime_device, CONCEPT_MODEL_REVISION),
                 device_key="concept_device",
                 dtype_key="concept_dtype",
                 optional_lane="concept",
-                runtime_device=runtime_device,
             ),
             "dense_matching": _component_capability(
                 key="matcher",
@@ -654,12 +485,10 @@ def _capabilities_payload() -> dict:
                 device_key="matcher_device",
                 dtype_key="matcher_dtype",
                 optional_lane="matcher",
-                runtime_device=runtime_device,
             ),
         },
         "inference": _inference_admission.stats(),
         "residency": _optional_residency_report(runtime_device),
-        "embedding_cache": _embed_cache_report(),
     }
 
 
@@ -687,7 +516,10 @@ def _readiness_payload() -> tuple[dict, int]:
                 {
                     "status": "not_ready",
                     "model": MODEL_ID,
-                    "revision": MODEL_REVISION,
+                    "revision": _metal_revision(
+                        getattr(_state.get("runtime_policy"), "device", None),
+                        MODEL_REVISION,
+                    ),
                     "error": str(exc)[:240],
                 },
                 503,
@@ -696,7 +528,7 @@ def _readiness_payload() -> tuple[dict, int]:
         {
             "status": "ready",
             "model": MODEL_ID,
-            "revision": MODEL_REVISION,
+            "revision": _state.get("revision"),
             "device": _state.get("device"),
             "dtype": _state.get("dtype"),
         },
@@ -759,7 +591,7 @@ def match_dense(
     import cv2
     import time
 
-    _ensure_component("matcher", _load_matcher, optional=True)
+    _ensure_component("matcher", _load_matcher)
     image_a = Image.open(file_a.file).convert("RGB")
     image_b = Image.open(file_b.file).convert("RGB")
     mask_image_a = Image.open(mask_a.file).convert("L")
@@ -812,31 +644,7 @@ def match_dense(
 # interactive: embed an image once, then decode per click (~4ms) — the M3 editor
 
 _EMBED_CACHE: "OrderedDict[str, dict]" = OrderedDict()
-_EMBED_CACHE_BYTES = 0
-_EMBED_CACHE_EVICTIONS = 0
-
-
-def _store_embedding(image_id: str, embedding, image: Image.Image) -> None:
-    """Store one embedding while enforcing both item and retained-byte caps."""
-
-    global _EMBED_CACHE_BYTES, _EMBED_CACHE_EVICTIONS
-
-    entry = {"emb": embedding, "image": image}
-    entry["retained_bytes"] = retained_bytes(entry)
-    replaced = _EMBED_CACHE.pop(image_id, None)
-    if replaced is not None:
-        _EMBED_CACHE_BYTES -= int(replaced.get("retained_bytes", 0))
-    _EMBED_CACHE[image_id] = entry
-    _EMBED_CACHE_BYTES += entry["retained_bytes"]
-
-    limits = _embed_cache_limits()
-    while len(_EMBED_CACHE) > 1 and (
-        len(_EMBED_CACHE) > limits["max_items"]
-        or _EMBED_CACHE_BYTES > limits["max_bytes"]
-    ):
-        _expired_id, expired = _EMBED_CACHE.popitem(last=False)
-        _EMBED_CACHE_BYTES -= int(expired.get("retained_bytes", 0))
-        _EMBED_CACHE_EVICTIONS += 1
+EMBED_MAX = 8
 
 
 @app.post("/embed")
@@ -850,7 +658,9 @@ def embed(file: UploadFile = File(...)) -> dict:
     with torch.inference_mode():
         emb = _state["model"].get_image_embeddings(inp["pixel_values"])
     image_id = _uuid.uuid4().hex[:12]
-    _store_embedding(image_id, emb, image)
+    _EMBED_CACHE[image_id] = {"emb": emb, "image": image}
+    while len(_EMBED_CACHE) > EMBED_MAX:
+        _EMBED_CACHE.popitem(last=False)
     return {"image_id": image_id, "width": image.width, "height": image.height}
 
 
@@ -1001,7 +811,7 @@ def segment_concept(
     """Text-prompted instance segmentation: every '<prompt>' in the image."""
     import torch
 
-    _ensure_component("concept", _load_concept, optional=True)
+    _ensure_component("concept", _load_concept)
     image = Image.open(file.file).convert("RGB")
     processor = _state["concept_processor"]
     model = _state["concept_model"]

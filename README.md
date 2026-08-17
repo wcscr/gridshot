@@ -89,30 +89,26 @@ Choose one accelerated runtime:
 
 **Apple Metal (initial support):**
 
-- Apple-silicon Mac running macOS 14 or later
-- Arm64 Python 3.12, [`uv`](https://docs.astral.sh/uv/), Node.js, and npm
-- Xcode command-line tools (`xcode-select --install`)
+- Apple Silicon Mac running macOS 14 or later
+- Complete the [macOS installation guide](docs/mac_os_setup.md) before first launch
 
 **NVIDIA CUDA:**
 
 - Docker with Compose and NVIDIA Container Toolkit
 - NVIDIA Ampere-generation or newer GPU with at least **8 GB VRAM**
 
-This fork validates the native Apple Metal/MPS path. The upstream CUDA path and
-instructions are retained for compatibility but have not been revalidated here.
+Native Apple Metal/MPS support is available on Apple Silicon Macs. The
+platform-aware launch scripts select the native implementation automatically on
+supported Macs.
 
 For the retained CUDA deployment, the 8 GB minimum covers the core SAM 2.1
 interactive capture workflow. **12 GB or more is recommended** when using SAM 3
 concept segmentation or RoMa dense matching. The current container runs inference
 in BF16; CPU-only and pre-Ampere GPUs are not supported configurations.
 
-The native Mac launcher runs MPS in FP32 with PyTorch CPU fallback disabled. It
-keeps the interactive SAM 2.1 model resident, admits at most one optional model at
-a time, evicts an optional model after five idle minutes on the next inference
-request, and limits cached image embeddings to eight entries and an estimated
-256 MiB. SAM 3 concept segmentation is enabled by default. RoMa is disabled by
-default on Metal and remains an explicit opt-in because that path has not yet been
-validated on MPS.
+The native Mac launcher runs MPS in FP32 with PyTorch CPU fallback disabled.
+Interactive SAM 2.1 remains resident, while SAM 3 concept segmentation loads on
+demand.
 
 GridShot uses GPU 0 by default. On a multi-GPU host, choose a different NVIDIA CDI
 device for the current launch:
@@ -146,40 +142,28 @@ with calipers and record both values. An unverified mat cannot be used for captu
 
 ### 2. Start GridShot
 
-On an NVIDIA workstation:
+Start GridShot with the platform-aware launcher:
 
 ```bash
 scripts/up
 ```
 
-On an Apple-silicon Mac, run the web and inference processes natively so
-PyTorch can reach Metal:
-
-```bash
-scripts/up-macos
-```
-
-Stop the native services with `scripts/down-macos`. Run native CLI commands with
-`scripts/gridshot-macos`; both use the same `config/`, `projects/`, and loopback
-inference service as the web application.
+On Linux, it retains the Docker/CUDA deployment. On Apple Silicon, it selects the
+native Metal implementation. The `scripts/gridshot` CLI wrapper uses the same
+platform detection, so the calibration commands above work on either runtime.
+See the [macOS installation guide](docs/mac_os_setup.md) for native prerequisites,
+first-run setup, and troubleshooting. Stop native Mac services with
+`scripts/down-macos`.
 
 SAM 3 is a gated Hugging Face model. Before the first concept-segmentation
 request, obtain access from the [SAM 3 model page](https://huggingface.co/facebook/sam3)
-and run `hf auth login`, or export an authorized `HF_TOKEN`. The native launcher
-keeps model files in the project cache through `HF_HUB_CACHE` without redirecting
-Hugging Face's normal credential store.
-
-The reduced random-weight SAM 3 architecture smoke test and the full pinned SAM 3
-checkpoint `/segment_concept` endpoint both pass on MPS in FP32 with CPU fallback
-disabled. Re-run the checkpoint validation with
-`GRIDSHOT_RUN_MPS_SAM3_TESTS=1` after dependency or model-revision changes.
+and authenticate as described in the macOS guide, or export an authorized
+`HF_TOKEN`.
 
 For a workstation-only deployment without Tailscale:
 
 ```bash
 scripts/up --no-tailscale
-# or on macOS
-scripts/up-macos --no-tailscale
 ```
 
 The launch scripts build and start the web and segmentation services, then expose
@@ -264,10 +248,10 @@ printer profiles, the tool library, and downloaded model caches live in `config/
 Both directories are created automatically by the launch scripts; back them up before
 moving or upgrading a deployment.
 
-Copy `.env.example` to `.env` for persistent Docker/CUDA settings. The native
-macOS launcher accepts the same settings as exported environment variables, for
-example `HF_TOKEN=... scripts/up-macos`. Use `scripts/prune --dry-run` to preview
-cleanup of old capture projects.
+Copy `.env.example` to `.env` for persistent settings. Docker Compose and the
+native macOS launcher both read it; variables exported by the invoking shell take
+precedence. Use `scripts/prune --dry-run` to preview cleanup of old capture
+projects.
 
 | Service | Port | Accelerator | Role |
 | --- | ---: | --- | --- |
@@ -285,25 +269,6 @@ Runtime probes are exposed through the web service:
 GPU inference is serialized with two waiting slots by default. Set
 `GRIDSHOT_INFERENCE_QUEUE_SIZE` to change the queue capacity. Saturated requests fail
 quickly with HTTP `429` and `Retry-After` instead of building an unbounded backlog.
-
-Native macOS unified-memory controls are available as exported environment
-variables:
-
-| Setting | Native default | Meaning |
-| --- | --- | --- |
-| `GRIDSHOT_ENABLE_SAM3` | `1` | Enable the on-demand SAM 3 concept lane. |
-| `GRIDSHOT_ENABLE_ROMA` | `0` | Install and enable the unvalidated RoMa Metal lane. |
-| `GRIDSHOT_OPTIONAL_MODEL_RESIDENCY` | `single` | Keep only one optional model resident; `multi` opts out. |
-| `GRIDSHOT_OPTIONAL_MODEL_IDLE_SECONDS` | `300` | Evict an idle optional model on the next inference request; `0` disables idle eviction. |
-| `GRIDSHOT_EMBED_CACHE_MAX_ITEMS` | `8` | Maximum cached interactive image embeddings. |
-| `GRIDSHOT_EMBED_CACHE_MAX_MIB` | `256` | Estimated combined tensor and decoded-image cache budget. |
-
-`/api/health/capabilities` reports each optional lane as `disabled`,
-`unavailable`, `not_loaded`, `ready`, `evicted`, or `error`, along with residency,
-embedding-cache, and MPS allocator telemetry. To experiment with RoMa on Metal,
-run `GRIDSHOT_ENABLE_ROMA=1 scripts/up-macos`; the launcher then installs the
-separate `matcher` dependency extra. This does not imply that RoMa has passed the
-Metal validation gate.
 
 ## Product status
 

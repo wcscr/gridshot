@@ -15,6 +15,11 @@ The SAM 3 operator surface can be smoke-tested without gated weights with:
     GRIDSHOT_RUN_MPS_SAM3_ARCH_TESTS=1 GRIDSHOT_ACCELERATOR=mps \
       python -m unittest tests.test_segserver_mps -v
 
+The RoMa endpoint, including coexistence with the interactive model, runs with:
+
+    GRIDSHOT_RUN_MPS_ROMA_TESTS=1 GRIDSHOT_ACCELERATOR=mps \
+      python -m unittest tests.test_segserver_mps -v
+
 The first run downloads the pinned checkpoint into ``HF_HUB_CACHE`` when set.
 """
 
@@ -24,6 +29,7 @@ import io
 import json
 import os
 import unittest
+from pathlib import Path
 
 
 @unittest.skipUnless(
@@ -97,10 +103,71 @@ class SegserverMPSIntegrationTests(unittest.TestCase):
             self.assertEqual(lane["dtype"], "float32")
             self.assertEqual(lane["revision"], segserver.MODEL_REVISION)
             self.assertEqual(capabilities["residency"]["mode"], "single")
-            self.assertEqual(capabilities["embedding_cache"]["entries"], 1)
-            self.assertGreater(
-                capabilities["embedding_cache"]["retained_bytes"], 0
+
+
+@unittest.skipUnless(
+    os.environ.get("GRIDSHOT_RUN_MPS_ROMA_TESTS") == "1",
+    "set GRIDSHOT_RUN_MPS_ROMA_TESTS=1 to exercise RoMa on Metal",
+)
+class SegserverRoMaMPSIntegrationTests(unittest.TestCase):
+    def test_dense_matching_endpoint_uses_mps_alongside_interactive_sam(self):
+        import torch
+        from fastapi.testclient import TestClient
+        from PIL import Image
+
+        if not torch.backends.mps.is_available():
+            self.skipTest("MPS is unavailable to this process")
+
+        from gridshot.segserver import main as segserver
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "assets"
+            / "readme"
+            / "07-selection-editor.png"
+        )
+        image = Image.open(source).convert("RGB")
+        image.thumbnail((960, 960))
+        mask = Image.new("L", image.size, 0)
+        mask.paste(255, (8, 8, image.width - 8, image.height - 8))
+        image_buffer = io.BytesIO()
+        mask_buffer = io.BytesIO()
+        image.save(image_buffer, format="PNG")
+        mask.save(mask_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+        mask_bytes = mask_buffer.getvalue()
+
+        with TestClient(segserver.app) as client:
+            # Load the always-resident interactive model first. The subsequent
+            # request proves RoMa can execute within the real Metal residency mix.
+            ready = client.get("/ready")
+            self.assertEqual(ready.status_code, 200, ready.text)
+            self.assertEqual(ready.json()["device"], "mps")
+
+            response = client.post(
+                "/match",
+                files={
+                    "file_a": ("a.png", image_bytes, "image/png"),
+                    "mask_a": ("a-mask.png", mask_bytes, "image/png"),
+                    "file_b": ("b.png", image_bytes, "image/png"),
+                    "mask_b": ("b-mask.png", mask_bytes, "image/png"),
+                },
+                data={"max_matches": "256"},
             )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["model"], "roma-outdoor-0.1.2")
+            self.assertEqual(payload["device"], "mps")
+            self.assertGreaterEqual(payload["foreground_matches"], 8)
+            self.assertEqual(len(payload["points_a"]), len(payload["points_b"]))
+            self.assertEqual(len(payload["points_a"]), len(payload["certainty"]))
+
+            capabilities = client.get("/capabilities").json()
+            lane = capabilities["capabilities"]["dense_matching"]
+            self.assertEqual(lane["status"], "ready")
+            self.assertEqual(lane["device"], "mps")
+            self.assertEqual(lane["dtype"], "float32")
+            self.assertIn("dense_matching", capabilities["residency"]["loaded"])
 
 
 @unittest.skipUnless(
