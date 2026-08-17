@@ -47,10 +47,6 @@ services:
       HF_HOME: /app/config/cache/hf
       TORCH_HOME: /app/config/cache/torch
       GRIDSHOT_SAM: ${GRIDSHOT_SAM:-sam2}
-      GRIDSHOT_SAM_REVISION: ${GRIDSHOT_SAM_REVISION:-}
-      GRIDSHOT_SAM3_REVISION: ${GRIDSHOT_SAM3_REVISION:-}
-      GRIDSHOT_ACCELERATOR: ${GRIDSHOT_ACCELERATOR:-auto}
-      GRIDSHOT_DTYPE: ${GRIDSHOT_DTYPE:-auto}
       GRIDSHOT_INFERENCE_QUEUE_SIZE: ${GRIDSHOT_INFERENCE_QUEUE_SIZE:-2}
     expose:
       - "8801"  # compose network only; web/cli are the public boundary

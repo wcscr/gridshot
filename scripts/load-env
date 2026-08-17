@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Parse simple Compose-style KEY=VALUE entries without executing .env as shell code.
+
+gridshot_load_env_file() {
+    local env_file="$1"
+    local line key value
+    local line_number=0
+
+    [[ -r "$env_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_number += 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+        if [[ "$line" == export[[:space:]]* ]]; then
+            line="${line#export}"
+            line="${line#"${line%%[![:space:]]*}"}"
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            echo "Invalid .env entry at line $line_number." >&2
+            return 2
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+            if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]] \
+                || [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+        # Match Docker Compose precedence: inherited shell variables override .env.
+        if ! declare -p "$key" >/dev/null 2>&1; then
+            export "$key=$value"
+        fi
+    done < "$env_file"
+}

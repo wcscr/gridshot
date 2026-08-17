@@ -2,6 +2,16 @@
 # Bring up the GridShot stack, optionally exposing it over HTTPS on the tailnet.
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ "$(uname -m)" != "arm64" ]]; then
+        echo "GridShot's native macOS runtime requires Apple Silicon (arm64)." >&2
+        exit 1
+    fi
+    export GRIDSHOT_LAUNCHER_NAME="scripts/up"
+    exec "$script_dir/up-macos" "$@"
+fi
+
 usage() {
     cat <<'EOF'
 Usage: scripts/up [--no-tailscale]

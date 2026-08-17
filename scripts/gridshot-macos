@@ -5,6 +5,10 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_dir"
 
+# shellcheck source=scripts/load-env
+source "$repo_dir/scripts/load-env"
+gridshot_load_env_file "$repo_dir/.env"
+
 export GRIDSHOT_CONFIG_DIR="${GRIDSHOT_CONFIG_DIR:-$repo_dir/config}"
 export GRIDSHOT_SEGSERVER_URL="${GRIDSHOT_SEGSERVER_URL:-http://127.0.0.1:8801}"
 exec uv run --frozen --extra server gridshot "$@"
