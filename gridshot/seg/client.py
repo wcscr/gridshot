@@ -14,6 +14,24 @@ from PIL import Image
 DEFAULT_URL = "http://segserver:8801"
 
 
+class OptionalCapabilityUnavailable(RuntimeError):
+    """An optional inference lane cannot serve this request."""
+
+
+def _http_error_detail(exc: httpx.HTTPError) -> str:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            payload = response.json()
+            detail = payload.get("detail") if isinstance(payload, dict) else None
+        except ValueError:
+            detail = None
+        if detail:
+            return f"HTTP {response.status_code}: {str(detail)[:240]}"
+        return f"HTTP {response.status_code}"
+    return str(exc)[:240]
+
+
 def server_url() -> str:
     return os.environ.get("GRIDSHOT_SEGSERVER_URL", DEFAULT_URL)
 
@@ -172,13 +190,16 @@ def segment_concept(
     """Text-prompted instances via SAM 3's concept path, best score first."""
     buf = io.BytesIO()
     Image.fromarray(pixels).save(buf, format="JPEG", quality=92)
-    r = httpx.post(
-        f"{server_url()}/segment_concept",
-        files={"file": ("image.jpg", buf.getvalue(), "image/jpeg")},
-        data={"prompt": prompt, "threshold": str(threshold)},
-        timeout=timeout,
-    )
-    r.raise_for_status()
+    try:
+        r = httpx.post(
+            f"{server_url()}/segment_concept",
+            files={"file": ("image.jpg", buf.getvalue(), "image/jpeg")},
+            data={"prompt": prompt, "threshold": str(threshold)},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise OptionalCapabilityUnavailable(_http_error_detail(exc)) from exc
     out = []
     for inst in r.json()["instances"]:
         mask = np.asarray(Image.open(io.BytesIO(base64.b64decode(inst["mask"]))))

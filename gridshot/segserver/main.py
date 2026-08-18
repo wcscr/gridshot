@@ -381,12 +381,31 @@ def _load_matcher():
         _touch_optional_lane("matcher")
 
 
-def _ensure_component(name: str, loader) -> None:
+def _model_load_error(exc: Exception) -> str:
+    raw = " ".join(str(exc).split())
+    lowered = raw.lower()
+    if "gated repo" in lowered or "authorized list" in lowered:
+        return (
+            "gated Hugging Face model access denied; request model access and "
+            "authenticate with `hf auth login` or an authorized HF_TOKEN"
+        )
+    return raw[:240]
+
+
+def _ensure_component(name: str, loader, *, optional: bool = False) -> None:
     try:
         loader()
         _state.pop(f"{name}_error", None)
+    except HTTPException:
+        raise
     except Exception as exc:
-        _state[f"{name}_error"] = str(exc)[:240]
+        error = _model_load_error(exc)
+        _state[f"{name}_error"] = error
+        if optional:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{name} model unavailable: {error}",
+            ) from exc
         raise
 
 
@@ -811,7 +830,7 @@ def segment_concept(
     """Text-prompted instance segmentation: every '<prompt>' in the image."""
     import torch
 
-    _ensure_component("concept", _load_concept)
+    _ensure_component("concept", _load_concept, optional=True)
     image = Image.open(file.file).convert("RGB")
     processor = _state["concept_processor"]
     model = _state["concept_model"]

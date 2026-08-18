@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from gridshot.segserver import main as segserver
 from gridshot.segserver.residency import (
     optional_model_idle_seconds,
@@ -63,6 +65,27 @@ class SegserverResidencyTests(unittest.TestCase):
         self.assertEqual(segserver._state["optional_evictions_total"], 1)
         synchronize.assert_called_once_with("mps")
         release.assert_called_once_with("mps")
+
+    def test_optional_model_load_failure_is_a_service_unavailable_state(self):
+        def fail_load():
+            raise OSError("Cannot access gated repo; account is not in authorized list")
+
+        with self.assertRaises(HTTPException) as raised:
+            segserver._ensure_component("concept", fail_load, optional=True)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("gated Hugging Face model access denied", raised.exception.detail)
+        self.assertNotIn("authorized list", raised.exception.detail)
+        self.assertIn("hf auth login", segserver._state["concept_error"])
+
+    def test_required_model_load_failure_still_raises_the_original_error(self):
+        def fail_load():
+            raise OSError("disk full")
+
+        with self.assertRaises(OSError):
+            segserver._ensure_component("interactive", fail_load)
+
+        self.assertEqual(segserver._state["interactive_error"], "disk full")
 
     def test_single_residency_evicts_the_other_optional_lane_on_admission(self):
         segserver._state.update(

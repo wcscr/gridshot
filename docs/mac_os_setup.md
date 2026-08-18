@@ -145,7 +145,10 @@ invoking shell take precedence. The file is ignored by Git.
 ## 6. Configure SAM 3 access
 
 Interactive SAM 2.1 segmentation does not require authentication. SAM 3 concept
-segmentation loads on demand and uses a gated Hugging Face checkpoint.
+segmentation loads on demand and uses a gated Hugging Face checkpoint. Without
+SAM 3 access, automatic tool detection records a warning and falls back to a
+less reliable CPU path when no empty-mat reference exists; interactive editing
+is unaffected.
 
 1. Request and accept access on the
    [SAM 3 model page](https://huggingface.co/facebook/sam3).
